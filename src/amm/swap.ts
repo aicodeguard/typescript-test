@@ -7,101 +7,160 @@ import { NATIVE_MINT } from '@solana/spl-token'
 import { printSimulateInfo } from '../util'
 import { PublicKey } from '@solana/web3.js'
 
-export const swap = async () => {
-  const raydium = await initSdk()
-  const amountIn = 500
-  const inputMint = NATIVE_MINT.toBase58()
-  const poolId = '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2' // SOL-USDC pool
-
-  let poolInfo: ApiV3PoolInfoStandardItem | undefined
-  let poolKeys: AmmV4Keys | undefined
-  let rpcData: AmmRpcData
-
-  if (raydium.cluster === 'mainnet') {
-    // note: api doesn't support get devnet pool info, so in devnet else we go rpc method
-    // if you wish to get pool info from rpc, also can modify logic to go rpc method directly
-    const data = await raydium.api.fetchPoolById({ ids: poolId })
-    poolInfo = data[0] as ApiV3PoolInfoStandardItem
-    if (!isValidAmm(poolInfo.programId)) throw new Error('target pool is not AMM pool')
-    poolKeys = await raydium.liquidity.getAmmPoolKeys(poolId)
-    rpcData = await raydium.liquidity.getRpcPoolInfo(poolId)
-  } else {
-    // note: getPoolInfoFromRpc method only return required pool data for computing not all detail pool info
-    const data = await raydium.liquidity.getPoolInfoFromRpc({ poolId })
-    poolInfo = data.poolInfo
-    poolKeys = data.poolKeys
-    rpcData = data.poolRpcData
+interface SwapConfig {
+  amountIn: number
+  inputMint?: string
+  poolId: string
+  slippage?: number
+  sendAndConfirm?: boolean
+  computeBudgetConfig?: {
+    units: number
+    microLamports: number
   }
-  const [baseReserve, quoteReserve, status] = [rpcData.baseReserve, rpcData.quoteReserve, rpcData.status.toNumber()]
-
-  if (poolInfo.mintA.address !== inputMint && poolInfo.mintB.address !== inputMint)
-    throw new Error('input mint does not match pool')
-
-  const baseIn = inputMint === poolInfo.mintA.address
-  const [mintIn, mintOut] = baseIn ? [poolInfo.mintA, poolInfo.mintB] : [poolInfo.mintB, poolInfo.mintA]
-
-  const out = raydium.liquidity.computeAmountOut({
-    poolInfo: {
-      ...poolInfo,
-      baseReserve,
-      quoteReserve,
-      status,
-      version: 4,
-    },
-    amountIn: new BN(amountIn),
-    mintIn: mintIn.address,
-    mintOut: mintOut.address,
-    slippage: 0.01, // range: 1 ~ 0.0001, means 100% ~ 0.01%
-  })
-
-  console.log(
-    `computed swap ${new Decimal(amountIn)
-      .div(10 ** mintIn.decimals)
-      .toDecimalPlaces(mintIn.decimals)
-      .toString()} ${mintIn.symbol || mintIn.address} to ${new Decimal(out.amountOut.toString())
-      .div(10 ** mintOut.decimals)
-      .toDecimalPlaces(mintOut.decimals)
-      .toString()} ${mintOut.symbol || mintOut.address}, minimum amount out ${new Decimal(out.minAmountOut.toString())
-      .div(10 ** mintOut.decimals)
-      .toDecimalPlaces(mintOut.decimals)} ${mintOut.symbol || mintOut.address}`
-  )
-
-  const { execute } = await raydium.liquidity.swap({
-    poolInfo,
-    poolKeys,
-    amountIn: new BN(amountIn),
-    amountOut: out.minAmountOut, // out.amountOut means amount 'without' slippage
-    fixedSide: 'in',
-    inputMint: mintIn.address,
-    txVersion,
-
-    // optional: set up token account
-    // config: {
-    //   inputUseSolBalance: true, // default: true, if you want to use existed wsol token account to pay token in, pass false
-    //   outputUseSolBalance: true, // default: true, if you want to use existed wsol token account to receive token out, pass false
-    //   associatedOnly: true, // default: true, if you want to use ata only, pass true
-    // },
-
-    // optional: set up priority fee here
-    // computeBudgetConfig: {
-    //   units: 600000,
-    //   microLamports: 46591500,
-    // },
-
-    // optional: add transfer sol to tip account instruction. e.g sent tip to jito
-    // txTipConfig: {
-    //   address: new PublicKey('96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5'),
-    //   amount: new BN(10000000), // 0.01 sol
-    // },
-  })
-
-  printSimulateInfo()
-  // don't want to wait confirm, set sendAndConfirm to false or don't pass any params to execute
-  const { txId } = await execute({ sendAndConfirm: true })
-  console.log(`swap successfully in amm pool:`, { txId: `https://explorer.solana.com/tx/${txId}` })
-
-  process.exit() // if you don't want to end up node execution, comment this line
+  txTipConfig?: {
+    address: PublicKey
+    amount: BN
+  }
 }
 
-/** uncomment code below to execute */
-// swap()
+interface SwapResult {
+  txId: string
+  amountIn: string
+  amountOut: string
+  minAmountOut: string
+  inputToken: string
+  outputToken: string
+}
+
+export const swap = async (config: SwapConfig): Promise<SwapResult> => {
+  try {
+    const {
+      amountIn,
+      inputMint = NATIVE_MINT.toBase58(),
+      poolId,
+      slippage = 0.01,
+      sendAndConfirm = true,
+      computeBudgetConfig,
+      txTipConfig
+    } = config
+
+    const raydium = await initSdk()
+    let poolInfo: ApiV3PoolInfoStandardItem | undefined
+    let poolKeys: AmmV4Keys | undefined
+    let rpcData: AmmRpcData
+
+    // Fetch pool information based on network
+    if (raydium.cluster === 'mainnet') {
+      const data = await raydium.api.fetchPoolById({ ids: poolId })
+      poolInfo = data[0] as ApiV3PoolInfoStandardItem
+      if (!isValidAmm(poolInfo.programId)) {
+        throw new Error('Target pool is not a valid AMM pool')
+      }
+      poolKeys = await raydium.liquidity.getAmmPoolKeys(poolId)
+      rpcData = await raydium.liquidity.getRpcPoolInfo(poolId)
+    } else {
+      const data = await raydium.liquidity.getPoolInfoFromRpc({ poolId })
+      poolInfo = data.poolInfo
+      poolKeys = data.poolKeys
+      rpcData = data.poolRpcData
+    }
+
+    if (!poolInfo || !poolKeys) {
+      throw new Error('Failed to fetch pool information')
+    }
+
+    const [baseReserve, quoteReserve, status] = [
+      rpcData.baseReserve,
+      rpcData.quoteReserve,
+      rpcData.status.toNumber()
+    ]
+
+    // Validate input mint
+    if (poolInfo.mintA.address !== inputMint && poolInfo.mintB.address !== inputMint) {
+      throw new Error('Input mint does not match pool configuration')
+    }
+
+    const baseIn = inputMint === poolInfo.mintA.address
+    const [mintIn, mintOut] = baseIn 
+      ? [poolInfo.mintA, poolInfo.mintB] 
+      : [poolInfo.mintB, poolInfo.mintA]
+
+    // Calculate swap amounts
+    const out = raydium.liquidity.computeAmountOut({
+      poolInfo: {
+        ...poolInfo,
+        baseReserve,
+        quoteReserve,
+        status,
+        version: 4,
+      },
+      amountIn: new BN(amountIn),
+      mintIn: mintIn.address,
+      mintOut: mintOut.address,
+      slippage,
+    })
+
+    const formattedAmountIn = new Decimal(amountIn)
+      .div(10 ** mintIn.decimals)
+      .toDecimalPlaces(mintIn.decimals)
+      .toString()
+
+    const formattedAmountOut = new Decimal(out.amountOut.toString())
+      .div(10 ** mintOut.decimals)
+      .toDecimalPlaces(mintOut.decimals)
+      .toString()
+
+    const formattedMinAmountOut = new Decimal(out.minAmountOut.toString())
+      .div(10 ** mintOut.decimals)
+      .toDecimalPlaces(mintOut.decimals)
+      .toString()
+
+    console.log(
+      `Computed swap: ${formattedAmountIn} ${mintIn.symbol || mintIn.address} to ` +
+      `${formattedAmountOut} ${mintOut.symbol || mintOut.address}, ` +
+      `minimum amount out: ${formattedMinAmountOut} ${mintOut.symbol || mintOut.address}`
+    )
+
+    // Execute swap
+    const { execute } = await raydium.liquidity.swap({
+      poolInfo,
+      poolKeys,
+      amountIn: new BN(amountIn),
+      amountOut: out.minAmountOut,
+      fixedSide: 'in',
+      inputMint: mintIn.address,
+      txVersion,
+      computeBudgetConfig,
+      txTipConfig,
+    })
+
+    printSimulateInfo()
+    
+    const { txId } = await execute({ sendAndConfirm })
+    console.log(`Swap successful in AMM pool:`, { 
+      txId: `https://explorer.solana.com/tx/${txId}` 
+    })
+
+    return {
+      txId,
+      amountIn: formattedAmountIn,
+      amountOut: formattedAmountOut,
+      minAmountOut: formattedMinAmountOut,
+      inputToken: mintIn.symbol || mintIn.address,
+      outputToken: mintOut.symbol || mintOut.address
+    }
+  } catch (error) {
+    console.error('Swap failed:', error)
+    throw error
+  }
+}
+
+/** Example usage:
+ * 
+ * await swap({
+ *   amountIn: 500,
+ *   poolId: '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2',
+ *   slippage: 0.01,
+ *   sendAndConfirm: true
+ * })
+ */
